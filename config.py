@@ -24,7 +24,7 @@ TICKERS = {
         "USD/JPY":  "USDJPY=X",
         "USD/INR":  "USDINR=X",
         "USD/CHF":  "USDCHF=X",
-        "USD/CNH":  "USDCNH=X",
+        "USD/CNY":  "CNY=X",
     },
     "Commodity": {
         "Crude Oil":   "CL=F",

@@ -6,71 +6,90 @@ import streamlit as st
 
 logger = logging.getLogger(__name__)
 
-# Minimum rows needed: 100 (DMA_100 warmup) + 50 (breakout lookback) + buffer
-_MIN_ROWS = 160
+# DMA_100 warmup (100) + breakout lookback (50) + small buffer = 120
+# Kept deliberately low so cloud-hosted tickers with slightly fewer
+# trading days (Indian / Asian markets) are not falsely rejected.
+_MIN_ROWS = 120
+
+# Fallback periods to try if the primary period returns too little data
+_PERIODS = ["2y", "3y", "5y"]
+
+
+def _clean(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """Flatten columns, select OHLCV, drop NaN rows."""
+    df = raw.copy()
+
+    # yfinance >= 0.2 may return MultiIndex(field, ticker)
+    if isinstance(df.columns, pd.MultiIndex):
+        level0 = df.columns.get_level_values(0).tolist()
+        if any(f in level0 for f in ("Open", "High", "Low", "Close")):
+            df.columns = df.columns.get_level_values(0)
+        else:
+            df.columns = df.columns.get_level_values(1)
+        logger.debug("%s — flattened MultiIndex columns", symbol)
+
+    ohlc = ["Open", "High", "Low", "Close"]
+    missing = [c for c in ohlc if c not in df.columns]
+    if missing:
+        logger.warning("%s — missing columns %s", symbol, missing)
+        return pd.DataFrame()
+
+    df = df[ohlc].copy()
+    df["Volume"] = raw["Volume"] if "Volume" in raw.columns else 0
+
+    before = len(df)
+    df.dropna(subset=ohlc, inplace=True)
+    dropped = before - len(df)
+    if dropped:
+        logger.debug("%s — dropped %d NaN rows", symbol, dropped)
+
+    return df
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_ohlcv(symbol: str, period: str = "2y") -> pd.DataFrame:
+def fetch_ohlcv(symbol: str) -> pd.DataFrame:
     """
-    Fetch OHLCV data from yfinance.
+    Fetch 2 years of OHLCV data from yfinance.
 
-    Returns an empty DataFrame on any failure or if data is too thin
-    (< 160 rows after cleaning), so callers can safely skip the ticker.
+    Retries with longer periods (3y, 5y) if 2y returns insufficient rows,
+    then trims back to the last 2 years worth of trading days (~504 rows).
+    This handles cloud environments where some exchanges (e.g. NSE) may
+    return fewer rows for a given period string.
 
-    Notes
-    -----
-    - auto_adjust=True: prices are split/dividend-adjusted as of download date.
-    - MultiIndex columns (yfinance ≥ 0.2) are flattened defensively.
-    - Rows with NaN in OHLC are dropped before the length check.
+    Returns empty DataFrame on failure — callers should skip such tickers.
     """
-    logger.info("Fetching %s (period=%s)", symbol, period)
-    try:
-        raw = yf.download(symbol, period=period, auto_adjust=True, progress=False)
-
-        if raw.empty:
-            logger.warning("%s — yfinance returned empty DataFrame", symbol)
-            return pd.DataFrame()
-
-        df = raw.copy()
-
-        # ── Flatten MultiIndex columns (yfinance >= 0.2 behaviour) ────────────
-        if isinstance(df.columns, pd.MultiIndex):
-            # Level 0 is the field name ('Open', 'High', …), level 1 is ticker.
-            # If level 0 does NOT look like OHLCV fields, try level 1.
-            level0 = df.columns.get_level_values(0).tolist()
-            if any(f in level0 for f in ("Open", "High", "Low", "Close")):
-                df.columns = df.columns.get_level_values(0)
-            else:
-                df.columns = df.columns.get_level_values(1)
-            logger.debug("%s — flattened MultiIndex columns", symbol)
-
-        # ── Select OHLCV; synthesise Volume=0 if missing ─────────────────────
-        ohlc = ["Open", "High", "Low", "Close"]
-        missing = [c for c in ohlc if c not in df.columns]
-        if missing:
-            logger.warning("%s — missing columns %s, skipping", symbol, missing)
-            return pd.DataFrame()
-
-        df = df[ohlc].copy()
-        df["Volume"] = raw.get("Volume", pd.Series(0, index=df.index))
-
-        # ── Drop NaN OHLC rows (gaps, bad data) ──────────────────────────────
-        before = len(df)
-        df.dropna(subset=ohlc, inplace=True)
-        if len(df) < before:
-            logger.debug("%s — dropped %d NaN rows", symbol, before - len(df))
-
-        if len(df) < _MIN_ROWS:
-            logger.warning(
-                "%s — only %d clean rows, need %d. Skipping.",
-                symbol, len(df), _MIN_ROWS,
+    for period in _PERIODS:
+        logger.info("Fetching %s (period=%s)", symbol, period)
+        try:
+            raw = yf.download(
+                symbol, period=period,
+                auto_adjust=True, progress=False,
             )
-            return pd.DataFrame()
+            if raw.empty:
+                logger.warning("%s — empty response for period=%s", symbol, period)
+                continue
 
-        logger.info("%s — %d rows fetched OK", symbol, len(df))
-        return df
+            df = _clean(raw, symbol)
+            if df.empty:
+                continue
 
-    except Exception as exc:
-        logger.error("Error fetching %s: %s", symbol, exc, exc_info=True)
-        return pd.DataFrame()
+            if len(df) < _MIN_ROWS:
+                logger.warning(
+                    "%s — only %d rows for period=%s (need %d), retrying …",
+                    symbol, len(df), period, _MIN_ROWS,
+                )
+                continue
+
+            # Trim to last ~504 trading days (≈ 2 years) after a wider fetch
+            if len(df) > 504:
+                df = df.iloc[-504:]
+
+            logger.info("%s — %d rows OK (period=%s)", symbol, len(df), period)
+            return df
+
+        except Exception as exc:
+            logger.error("Error fetching %s (period=%s): %s", symbol, period, exc)
+            continue
+
+    logger.error("%s — all periods failed, skipping ticker", symbol)
+    return pd.DataFrame()
